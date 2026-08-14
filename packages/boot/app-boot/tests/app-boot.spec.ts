@@ -2,13 +2,13 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import {
   addHarnessSourceSection, assertEntriesActivated, assertEntriesLoaded, boot,
-  FAIL_LOUD_RELEASE_TIMEOUT_MS, HARNESS_SOURCE_SECTION,
-  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, resolveConfigPath, type FailLoudProcess,
+  detectProxyEnv, FAIL_LOUD_RELEASE_TIMEOUT_MS, HARNESS_SOURCE_SECTION,
+  installEnvProxyDispatcher, installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, resolveConfigPath, type FailLoudProcess,
 } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
@@ -831,5 +831,109 @@ describe('addHarnessSourceSection', () => {
     } finally {
       await ctx.fiber.dispose()
     }
+  })
+})
+
+describe('detectProxyEnv', () => {
+  it('returns undefined when no proxy URL variable is set', () => {
+    expect(detectProxyEnv({})).toBeUndefined()
+    expect(detectProxyEnv({ NO_PROXY: 'localhost,127.0.0.1' })).toBeUndefined()
+    expect(detectProxyEnv({ no_proxy: 'localhost,127.0.0.1' })).toBeUndefined()
+    // ALL_PROXY is intentionally NOT a trigger: undici's EnvHttpProxyAgent
+    // does not consult it, so triggering would report a false "installed".
+    expect(detectProxyEnv({ ALL_PROXY: 'socks5://corp.example:1080' })).toBeUndefined()
+  })
+
+  it('returns the first set proxy URL variable (https wins over http, lowercase first)', () => {
+    // Lowercase is checked before uppercase, matching undici's EnvHttpProxyAgent.
+    expect(detectProxyEnv({ https_proxy: 'http://corp.example:8080' })).toEqual({
+      name: 'https_proxy', value: 'http://corp.example:8080',
+    })
+    expect(detectProxyEnv({ HTTPS_PROXY: 'http://corp.example:8080' })).toEqual({
+      name: 'HTTPS_PROXY', value: 'http://corp.example:8080',
+    })
+    expect(detectProxyEnv({ http_proxy: 'http://corp.example:8080' })).toEqual({
+      name: 'http_proxy', value: 'http://corp.example:8080',
+    })
+    expect(detectProxyEnv({ HTTP_PROXY: 'http://corp.example:8080' })).toEqual({
+      name: 'HTTP_PROXY', value: 'http://corp.example:8080',
+    })
+    // https_* wins over http_* regardless of case.
+    expect(detectProxyEnv({
+      https_proxy: 'http://corp.example:8080',
+      HTTP_PROXY: 'http://other.example:8080',
+    })).toEqual({ name: 'https_proxy', value: 'http://corp.example:8080' })
+  })
+
+  it('treats an empty-string value as unset', () => {
+    expect(detectProxyEnv({ HTTPS_PROXY: '' })).toBeUndefined()
+    expect(detectProxyEnv({ https_proxy: '' })).toBeUndefined()
+  })
+})
+
+describe('installEnvProxyDispatcher', () => {
+  // Capture and restore the global fetch so a real proxy install never leaks
+  // out of this suite into sibling tests (or the runner itself).
+  const originalFetch = globalThis.fetch
+  const PROXY_NAMES = [
+    'https_proxy', 'HTTPS_PROXY',
+    'http_proxy', 'HTTP_PROXY',
+    'no_proxy', 'NO_PROXY',
+    'ALL_PROXY', 'all_proxy',
+  ] as const
+
+  function clearProxyEnv(): void {
+    for (const name of PROXY_NAMES) Reflect.deleteProperty(process.env, name)
+  }
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    clearProxyEnv()
+  })
+
+  it('is a no-op when no proxy URL variable is set and leaves globalThis.fetch untouched', () => {
+    clearProxyEnv()
+    const before = globalThis.fetch
+    const warn = vi.fn()
+    const result = installEnvProxyDispatcher(NAME, warn)
+    expect(result).toEqual({ installed: false })
+    expect(globalThis.fetch).toBe(before)
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('installs the proxy dispatcher and replaces globalThis.fetch when a proxy is set', () => {
+    clearProxyEnv()
+    // Use the lowercase form: it is checked first by detectProxyEnv (matching
+    // undici's EnvHttpProxyAgent) and behaves consistently across platforms.
+    // On Windows process.env is case-insensitive, so setting HTTPS_PROXY would
+    // also satisfy the https_proxy check — using lowercase keeps the assertion
+    // platform-independent.
+    process.env.https_proxy = 'http://corp.example:8080'
+    const warn = vi.fn()
+    const before = globalThis.fetch
+    const result = installEnvProxyDispatcher(NAME, warn)
+    expect(result).toEqual({
+      installed: true,
+      source: 'https_proxy',
+      proxyUrl: 'http://corp.example:8080',
+    })
+    // The global fetch is replaced with undici's so the dispatcher applies.
+    expect(globalThis.fetch).not.toBe(before)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0]?.[0]).toContain(`${NAME}: routing fetch through https_proxy=`)
+    expect(warn.mock.calls[0]?.[0]).toContain('http://corp.example:8080')
+  })
+
+  it('is idempotent: a second call with the proxy still set re-installs cleanly', () => {
+    clearProxyEnv()
+    process.env.https_proxy = 'http://corp.example:8080'
+    const warn = vi.fn()
+    const first = installEnvProxyDispatcher(NAME, warn)
+    const afterFirst = globalThis.fetch
+    const second = installEnvProxyDispatcher(NAME, warn)
+    expect(first.installed).toBe(true)
+    expect(second.installed).toBe(true)
+    // The fetch reference is replaced again with the same undici fetch export.
+    expect(globalThis.fetch).toBe(afterFirst)
   })
 })

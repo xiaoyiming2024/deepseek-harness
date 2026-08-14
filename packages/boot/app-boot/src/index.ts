@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs'
 import { parseEnv } from 'node:util'
 import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import * as yaml from 'js-yaml'
+import { EnvHttpProxyAgent, fetch as undiciFetch, setGlobalDispatcher } from 'undici'
 import { Context, type FiberState } from '@deepseek-ai/cordis'
 import Loader, { type Entry, type EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import Include, { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
@@ -195,6 +196,102 @@ export function loadLayeredEnv(
     ...project === undefined ? [] : [{ source: 'project-env' as const, path: project.path, values: project.values }],
     ...user === undefined ? [] : [{ source: 'user-env' as const, path: user.path, values: user.values }],
   ])
+}
+
+/**
+ * The proxy URL environment variable names whose presence triggers a dispatcher
+ * install, in the same lowercase-first order undici's `EnvHttpProxyAgent`
+ * consults them. `NO_PROXY` is intentionally excluded from the trigger: on its
+ * own it specifies bypass rules for a proxy that is not configured, so
+ * installing a proxy-aware dispatcher would add overhead without routing
+ * anywhere. `ALL_PROXY` is also excluded: undici's `EnvHttpProxyAgent` does
+ * not consult it, so triggering on it would report a false "installed" while
+ * the dispatcher silently fell back to a direct connection. All of these are
+ * reserved as bootstrap-only by {@link BOOTSTRAP_NAMES}, so they reach this
+ * point only through the inherited process environment, never a discovered
+ * `.env`.
+ *
+ * Both cases are listed because `process.env` is case-sensitive on POSIX and
+ * case-insensitive on Windows: on POSIX a user who exports `https_proxy`
+ * (the curl/Python convention) would be missed by an uppercase-only check,
+ * even though `EnvHttpProxyAgent` itself reads the lowercase form first.
+ */
+const PROXY_URL_ENV_NAMES = [
+  'https_proxy', 'HTTPS_PROXY',
+  'http_proxy', 'HTTP_PROXY',
+] as const
+
+/**
+ * Whether a proxy URL environment variable is set. Undici's
+ * `EnvHttpProxyAgent` consults these per request, so an absent set means the
+ * default dispatcher is already correct and installing a proxy-aware one would
+ * only add overhead.
+ * @param env - the environment to inspect; defaults to `process.env`.
+ * @returns the first set proxy variable (upper-cased name and value), or
+ * `undefined` when none is set.
+ */
+export function detectProxyEnv(
+  env: Record<string, string | undefined> = process.env,
+): { name: string; value: string } | undefined {
+  for (const name of PROXY_URL_ENV_NAMES) {
+    const value = env[name]
+    if (value !== undefined && value.length > 0) return { name, value }
+  }
+  return undefined
+}
+
+/** The outcome of one {@link installEnvProxyDispatcher} call, for caller logging. */
+export interface ProxyDispatcherInstall {
+  /** `true` when a proxy was detected and the dispatcher was replaced. */
+  installed: boolean
+  /** The proxy variable name that triggered the installation, when `installed`. */
+  source?: string
+  /** The proxy URL that triggered the installation, when `installed`. */
+  proxyUrl?: string
+}
+
+/**
+ * Install an undici `EnvHttpProxyAgent` as the global dispatcher and alias
+ * `globalThis.fetch` to undici's `fetch`, so every consumer of the global —
+ * including third-party libraries that call `globalThis.fetch` directly —
+ * routes through `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (with `NO_PROXY`
+ * honored as the bypass list).
+ *
+ * This exists because Node's built-in `fetch` (powered by an internal undici
+ * copy) does NOT honor the proxy environment variables on its own, and an
+ * npm-installed `undici`'s `setGlobalDispatcher` does NOT reach Node's
+ * internal fetch either: the two copies keep separate dispatcher state. The
+ * only way to make the proxy apply to the global `fetch` callers already use
+ * is to replace the global with the npm undici's `fetch`, whose dispatcher
+ * the same call also configures.
+ *
+ * Safe to call when no proxy is set: it returns `{ installed: false }` and
+ * leaves `globalThis.fetch` and the dispatcher untouched, so default behavior
+ * is unchanged on networks without a proxy. Idempotent: a second call with a
+ * proxy still set re-installs the same `EnvHttpProxyAgent` shape.
+ *
+ * Call after {@link loadLayeredEnv} (so the proxy variables are in
+ * `process.env`) and before any plugin that issues network requests mounts.
+ * @param binName - the diagnostic prefix on the install log line.
+ * @param warn - sink for the one-line install diagnostic; defaults to stderr.
+ * @returns the install outcome.
+ */
+export function installEnvProxyDispatcher(
+  binName: string,
+  warn: (line: string) => void = line => void process.stderr.write(line),
+): ProxyDispatcherInstall {
+  const detected = detectProxyEnv()
+  if (detected === undefined) return { installed: false }
+  setGlobalDispatcher(new EnvHttpProxyAgent())
+  // Replace the global fetch with undici's so the dispatcher we just set
+  // applies. Node's built-in fetch is a *separate* undici instance whose
+  // dispatcher state this call cannot reach, so aliasing is required. The cast
+  // bridges a type skew: undici's `fetch` types `input` as `RequestInfo`
+  // (string | Request) while the DOM lib's global types it as
+  // `RequestInfo | URL`; at runtime undici accepts `URL` too.
+  globalThis.fetch = undiciFetch as unknown as typeof globalThis.fetch
+  warn(`${binName}: routing fetch through ${detected.name}=${detected.value}\n`)
+  return { installed: true, source: detected.name, proxyUrl: detected.value }
 }
 
 const bootstrapIncludes = new WeakMap<Context, Entry>()

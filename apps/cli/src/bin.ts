@@ -10,7 +10,7 @@
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { loadLayeredEnv } from '@deepseek-ai/dsh-app-boot'
+import { installEnvProxyDispatcher, loadLayeredEnv } from '@deepseek-ai/dsh-app-boot'
 import { parseDshArgs } from './args.ts'
 
 // Both the source tree (apps/cli/src) and the bundled bin (apps/cli/lib) sit
@@ -25,6 +25,13 @@ function readVersion(): string {
 }
 
 const invocation = parseDshArgs(process.argv.slice(2), readVersion())
+
+// Wire the global fetch to honor HTTPS_PROXY/HTTP_PROXY/ALL_PROXY (with
+// NO_PROXY as the bypass list) before any plugin — which may issue network
+// requests — mounts. Node's built-in fetch ignores these by default; on a
+// corporate proxy network this is what lets an external baseURL reach the
+// open internet. No-op when no proxy is configured.
+installEnvProxyDispatcher('dsh')
 
 switch (invocation.mode) {
   case 'profile': {
